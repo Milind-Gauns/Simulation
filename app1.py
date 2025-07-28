@@ -1,106 +1,77 @@
+import os
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from simulation import run_simulation  # your unified CG→LG & LG→FPS algorithm
+from simulation import run_simulation
 
-# ————————————————————————————————
-# 1. Page config
-# ————————————————————————————————
-st.set_page_config(
-    page_title="Grain Distribution Simulator",
-    layout="wide",
-)
+# 1) Page config
+st.set_page_config(page_title="Grain Distribution Simulator", layout="wide")
 
-# ————————————————————————————————
-# 2. Helper to build downloadable Excel
-# ————————————————————————————————
-def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+# 2) Download helper
+def to_excel(sheets: dict[str,pd.DataFrame]) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name, index=False)
-    return buffer.getvalue()
+            df.to_excel(w, sheet_name=name, index=False)
+    return buf.getvalue()
 
-# ————————————————————————————————
-# 3. UI: Title & instructions
-# ————————————————————————————————
+# 3) UI title
 st.title("🚛 Grain Distribution Simulator")
-st.markdown("""
-1. Upload your **master workbook** (must include at least `Settings`, `LGs`, `FPS`; optional: `Vehicles`, `LG_Daily_Req`, `LG_Capacity`).  
-2. Click **Run Simulation**.  
-3. Download the **simulation_output.xlsx** and feed it into your dashboard app.
-""")
 
-# ————————————————————————————————
-# 4. File uploader
-# ————————————————————————————————
-uploaded = st.file_uploader(
-    "Upload Master Workbook (.xlsx)",
-    type="xlsx",
-    help="Should contain sheets: Settings, LGs, FPS (plus optional Vehicles, LG_Daily_Req, LG_Capacity)."
-)
-if uploaded is None:
-    st.info("Using default template from repo: `grain_simulator_template.xlsx`.")
-    master_path = "grain_simulator_template.xlsx"
+# 4) File uploader + fallback
+uploaded = st.file_uploader("Upload master workbook (.xlsx)", type="xlsx")
+if uploaded is not None:
+    master = uploaded
+elif os.path.exists("grain_simulator_template.xlsx"):
+    master = "grain_simulator_template.xlsx"
 else:
-    master_path = uploaded
+    st.error("❌ Please upload an Excel template first.")
+    st.stop()
 
-# ————————————————————————————————
-# 5. Load inputs (cached)
-# ————————————————————————————————
-@st.cache_data(show_spinner=False)
+# 5) Load input sheets
+@st.cache_data
 def load_inputs(path):
-    settings = pd.read_excel(path, sheet_name="Settings")
-    lgs      = pd.read_excel(path, sheet_name="LGs")
-    fps      = pd.read_excel(path, sheet_name="FPS")
+    s = pd.read_excel(path, sheet_name="Settings")
+    lg= pd.read_excel(path, sheet_name="LGs")
+    fp= pd.read_excel(path, sheet_name="FPS")
     try:
-        vehicles = pd.read_excel(path, sheet_name="Vehicles")
+        vh= pd.read_excel(path, sheet_name="Vehicles")
     except ValueError:
-        vehicles = pd.DataFrame(columns=["Vehicle_ID","Capacity_tons","Mapped_LG_IDs"])
-    return settings, lgs, fps, vehicles
+        vh = pd.DataFrame(columns=["Vehicle_ID","Capacity_tons","Mapped_LG_IDs"])
+    return s, lg, fp, vh
 
-settings, lgs, fps, vehicles = load_inputs(master_path)
+settings, lgs, fps, vehicles = load_inputs(master)
 
-# ————————————————————————————————
-# 6. Preview input data
-# ————————————————————————————————
-with st.expander("🔍 Preview Uploaded Data"):
-    st.subheader("Settings")
-    st.dataframe(settings, height=150)
-    st.subheader("Local Godowns (LGs)")
-    st.dataframe(lgs, height=200)
-    st.subheader("Fair Price Shops (FPS)")
-    st.dataframe(fps, height=200)
-    st.subheader("Vehicles")
-    st.dataframe(vehicles, height=150)
+# 6) Preview
+with st.expander("🔍 Preview inputs"):
+    st.subheader("Settings");      st.dataframe(settings)
+    st.subheader("Local Godowns"); st.dataframe(lgs)
+    st.subheader("Shops (FPS)");   st.dataframe(fps)
+    st.subheader("Vehicles");      st.dataframe(vehicles)
 
-# ————————————————————————————————
-# 7. Run simulation button
-# ————————————————————————————————
+# 7) Run button
 if st.button("▶️ Run Simulation"):
-    with st.spinner("Computing optimal dispatch…"):
+    with st.spinner("Running…"):
         dispatch_cg, dispatch_lg, stock_levels = run_simulation(
-            settings, lgs, fps, vehicles
+            master, settings, lgs, fps, vehicles
         )
-    st.success("Simulation complete! ✅")
+    st.success("✅ Done")
 
-    # Package inputs + outputs
-    all_sheets = {
-        "Settings":       settings,
-        "LGs":            lgs,
-        "FPS":            fps,
-        "Vehicles":       vehicles,
-        "CG_to_LG":       dispatch_cg,
-        "LG_to_FPS":      dispatch_lg,
-        "Stock_Levels":   stock_levels,
+    # package
+    sheets = {
+        "Settings": settings,
+        "LGs":      lgs,
+        "FPS":      fps,
+        "Vehicles": vehicles,
+        "CG_to_LG": dispatch_cg,
+        "LG_to_FPS":dispatch_lg,
+        "Stock_Levels": stock_levels,
     }
-    excel_data = to_excel(all_sheets)
-
+    data = to_excel(sheets)
     st.download_button(
-        label="📥 Download simulation_output.xlsx",
-        data=excel_data,
-        file_name="simulation_output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "📥 Download simulation_output.xlsx",
+        data, "simulation_output.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 else:
-    st.info("Click **Run Simulation** to execute the distribution algorithm.")
+    st.info("Upload your workbook and click **Run Simulation**")
