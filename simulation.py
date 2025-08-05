@@ -112,6 +112,8 @@ def run_simulation(
     # ——————————————————————————————————————————————
     # 2) Derive LG daily requirement from LG→FPS results
     # ——————————————————————————————————————————————
+    print("Dispatch LG Columns:", dispatch_lg.columns.tolist())
+print("Dispatch LG Head:\n", dispatch_lg.head())
     lg_req = (
         dispatch_lg
         .groupby(["LG_ID","Day"])["Quantity_tons"]
