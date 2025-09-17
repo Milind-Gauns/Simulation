@@ -4,7 +4,7 @@ from io import BytesIO
 import streamlit as st
 import pandas as pd
 
-from simulation import run_simulation  # ensure simulation.py sits alongside this file
+from simulation import run_simulation  # make sure simulation.py is alongside this file
 
 st.set_page_config(page_title="Grain Distribution Simulator", layout="wide")
 st.title("🚛 Grain Distribution Simulator")
@@ -12,7 +12,10 @@ st.title("🚛 Grain Distribution Simulator")
 # ---------------------------
 # Helpers
 # ---------------------------
+REQUIRED_SHEETS = ["Settings", "LGs", "FPS"]  # Vehicles is optional
+
 def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """Write multiple DataFrames (sheet_name -> df) into one Excel bytes object."""
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         for name, df in sheets.items():
@@ -21,6 +24,7 @@ def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
     return buf.getvalue()
 
 def template_workbook() -> bytes:
+    """Return a minimal template workbook with correct headers."""
     settings = pd.DataFrame({
         "Parameter": [
             "Distribution_Days",
@@ -28,12 +32,12 @@ def template_workbook() -> bytes:
             "Vehicles_Total",
             "Max_Trips_Per_Vehicle_Per_Day",
             "Default_Lead_Time_days",
+            "Start_Date",  # YYYY-MM-DD start date for timeline (optional)
             "AAY_kg_per_card",
             "PHH_kg_per_beneficiary",
             "APL_kg_per_card",
-            "Start_Date"
         ],
-        "Value": [30, 11.5, 30, 3, 3, 35, 5, 0, pd.Timestamp.today().strftime("%Y-%m-%d")],
+        "Value": [30, 11.5, 30, 3, 3, pd.Timestamp.today().strftime("%Y-%m-%d"), 35.0, 5.0, 2.5],
     })
 
     lgs = pd.DataFrame({
@@ -47,13 +51,15 @@ def template_workbook() -> bytes:
     fps = pd.DataFrame({
         "FPS_ID": [101, 102, 201],
         "FPS_Name": ["Shop_101", "Shop_102", "Shop_201"],
-        "Monthly_Demand_tons": [150.0, 90.0, 120.0],
+        # we'll compute Monthly_Demand_tons from the counts below
+        "AAY_Count": [1000, 500, 800],
+        "PHH_Beneficiaries": [200, 100, 50],
+        "APL_Count": [50, 30, 20],
         "Max_Capacity_tons": [40.0, 30.0, 35.0],
+        # Can be LG_ID (1/2) or LG_Name ("LG_A"/"LG_B")
         "Linked_LG_ID": ["LG_A", "LG_B", "LG_A"],
+        # Optional; if omitted, defaults to settings["Default_Lead_Time_days"]
         "Lead_Time_days": [3, None, 2],
-        "AAY_Count": [100, 50, 80],
-        "PHH_Beneficiaries": [200, 100, 150],
-        "APL_Count": [0, 0, 10]
     })
 
     vehicles = pd.DataFrame({
@@ -71,6 +77,7 @@ def template_workbook() -> bytes:
     })
 
 def read_sheet(xls_obj, sheet, required_cols=None) -> pd.DataFrame:
+    """Read a sheet and optionally validate columns; raise ValueError with a friendly message."""
     try:
         df = pd.read_excel(xls_obj, sheet_name=sheet)
     except ValueError as e:
@@ -83,25 +90,62 @@ def read_sheet(xls_obj, sheet, required_cols=None) -> pd.DataFrame:
 
 @st.cache_data
 def load_inputs(src):
+    """Load required inputs from uploaded file or path; Vehicles is optional."""
     data = src.read() if hasattr(src, "read") else open(src, "rb").read()
     xls = BytesIO(data)
 
-    settings = read_sheet(xls, "Settings", required_cols={"Parameter", "Value"})
+    settings = read_sheet(
+        xls, "Settings",
+        required_cols={"Parameter", "Value"}
+    )
     xls.seek(0)
-    lgs = read_sheet(xls, "LGs", required_cols={"LG_ID", "LG_Name"})
+    lgs = read_sheet(
+        xls, "LGs",
+        required_cols={"LG_ID", "LG_Name"}
+    )
     xls.seek(0)
-    # FPS: require key linking & capacity but allow counts instead of Monthly_Demand_tons
-    fps = read_sheet(xls, "FPS", required_cols={"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"})
+    fps = read_sheet(
+        xls, "FPS",
+        required_cols={"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
+    )
     xls.seek(0)
     try:
-        vehicles = read_sheet(xls, "Vehicles", required_cols={"Vehicle_ID"})
+        vehicles = read_sheet(
+            xls, "Vehicles",
+            required_cols={"Vehicle_ID"}  # Capacity_tons & Mapped_LG_IDs are optional
+        )
     except ValueError:
         vehicles = pd.DataFrame(columns=["Vehicle_ID", "Capacity_tons", "Mapped_LG_IDs"])
+
+    # --- derive Monthly_Demand_tons from RC counts automatically ---
+    # Determine settings for eligibilities
+    def _get_setting_param(s_df, name, default):
+        try:
+            return float(s_df.loc[s_df["Parameter"] == name, "Value"].iloc[0])
+        except Exception:
+            return float(default)
+
+    AAY_kg = _get_setting_param(settings, "AAY_kg_per_card", 35.0)
+    PHH_kg = _get_setting_param(settings, "PHH_kg_per_beneficiary", 5.0)
+    APL_kg = _get_setting_param(settings, "APL_kg_per_card", 0.0)
+
+    # normalize/ensure count columns exist
+    fps = fps.copy()
+    fps["AAY_Count"] = fps.get("AAY_Count", 0).fillna(0).astype(float)
+    fps["PHH_Beneficiaries"] = fps.get("PHH_Beneficiaries", 0).fillna(0).astype(float)
+    fps["APL_Count"] = fps.get("APL_Count", 0).fillna(0).astype(float)
+
+    # compute monthly demand (kg -> tons). User requested monthly demand = counts * eligibility (kgs) converted to tons.
+    fps["Monthly_from_counts_kg"] = fps["AAY_Count"] * AAY_kg + fps["PHH_Beneficiaries"] * PHH_kg + fps["APL_Count"] * APL_kg
+    fps["Monthly_Demand_tons"] = fps.get("Monthly_Demand_tons")
+    fps["Monthly_Demand_tons"] = pd.to_numeric(fps["Monthly_Demand_tons"], errors="coerce")
+    # override or fill with computed value — user said they will not enter demand, so prefer derived value
+    fps["Monthly_Demand_tons"] = (fps["Monthly_from_counts_kg"] / 1000.0).fillna(0.0)
 
     return settings, lgs, fps, vehicles
 
 # ---------------------------
-# Sidebar template & upload
+# Sidebar: template download
 # ---------------------------
 with st.sidebar:
     st.subheader("📄 Template")
@@ -113,6 +157,9 @@ with st.sidebar:
         use_container_width=True
     )
 
+# ---------------------------
+# Upload or fallback to local
+# ---------------------------
 uploaded = st.file_uploader("Upload master workbook (.xlsx)", type="xlsx")
 if uploaded is not None:
     master = uploaded
@@ -139,7 +186,7 @@ with st.expander("🔍 Preview Inputs", expanded=False):
         st.subheader("LGs")
         st.dataframe(lgs, use_container_width=True)
     with c2:
-        st.subheader("FPS")
+        st.subheader("FPS (counts-derived demand)")
         st.dataframe(fps, use_container_width=True)
         st.subheader("Vehicles")
         st.dataframe(vehicles, use_container_width=True)
@@ -155,6 +202,7 @@ if st.button("▶️ Run Simulation", use_container_width=True):
             )
         st.success("✅ Simulation complete")
 
+        # Previews
         with st.expander("👀 Preview Results", expanded=False):
             st.subheader("LG → FPS (dispatch_lg)")
             st.dataframe(dispatch_lg, use_container_width=True, height=240)
@@ -163,13 +211,14 @@ if st.button("▶️ Run Simulation", use_container_width=True):
             st.subheader("Stock Levels")
             st.dataframe(stock_levels, use_container_width=True, height=240)
 
+        # Package for download
         output_sheets = {
-            "Settings": settings,
-            "LGs": lgs,
-            "FPS": fps,
-            "Vehicles": vehicles,
-            "LG_to_FPS": dispatch_lg,
-            "CG_to_LG": dispatch_cg,
+            "Settings":     settings,
+            "LGs":          lgs,
+            "FPS":          fps,
+            "Vehicles":     vehicles,
+            "LG_to_FPS":    dispatch_lg,
+            "CG_to_LG":     dispatch_cg,
             "Stock_Levels": stock_levels,
         }
         excel_bytes = to_excel(output_sheets)
