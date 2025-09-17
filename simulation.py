@@ -1,8 +1,5 @@
 # simulation.py
-import streamlit
-import io
 import pandas as pd
-import math
 import numpy as np
 
 def run_simulation(
@@ -13,16 +10,15 @@ def run_simulation(
     vehicles: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Runs a two-phase simulation (unchanged logic) but:
-    - Adds 'Date' mapping for each Day (skips Sundays).
-    - Computes FPS demand from RC counts (AAY, PHH, APL) using Settings eligibilities.
-    - Splits dispatched quantities into AAY / PHH / APL (and NSFA=AAY+PHH).
-    Returns:
-        (dispatch_cg, dispatch_lg, stock_levels)
-    """
+    Runs a two-phase simulation:
+      - LG -> FPS dispatch (dispatch_lg) (with category splits and Date)
+      - CG -> LG pre-dispatch (dispatch_cg) (with category splits and Date)
+      - stock_levels: end-of-day stocks for FPS and LGs (with Date)
 
+    Returns (dispatch_cg, dispatch_lg, stock_levels)
+    """
     # -----------------------------
-    # 0) Read key parameters safely
+    # Helpers to read settings
     # -----------------------------
     def _get_setting(param_name, default=None, cast=float):
         try:
@@ -33,49 +29,44 @@ def run_simulation(
                 raise ValueError(f"Missing required setting: {param_name}")
             return cast(default)
 
-    # numeric settings
-    DAYS       = _get_setting("Distribution_Days", default=30, cast=int)
-    TRUCK_CAP  = _get_setting("Vehicle_Capacity_tons", default=11.5, cast=float)
-    TOT_V      = _get_setting("Vehicles_Total", default=30, cast=int)
-    MAX_TRIPS  = _get_setting("Max_Trips_Per_Vehicle_Per_Day", default=3, cast=int)
+    # numeric basic settings
+    DAYS = _get_setting("Distribution_Days", default=30, cast=int)
+    TRUCK_CAP = _get_setting("Vehicle_Capacity_tons", default=11.5, cast=float)
+    TOT_V = _get_setting("Vehicles_Total", default=30, cast=int)
+    MAX_TRIPS = _get_setting("Max_Trips_Per_Vehicle_Per_Day", default=3, cast=int)
     DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", default=3.0, cast=float)
 
-    # optional eligibility settings (kg). Defaults: AAY=35 kg, PHH=5 kg, APL=0 kg
-    try:
-        AAY_kg = float(settings.loc[settings["Parameter"] == "AAY_kg_per_card", "Value"].iloc[0])
-    except Exception:
-        AAY_kg = 35.0
-    try:
-        PHH_kg = float(settings.loc[settings["Parameter"] == "PHH_kg_per_beneficiary", "Value"].iloc[0])
-    except Exception:
-        PHH_kg = 5.0
-    try:
-        APL_kg = float(settings.loc[settings["Parameter"] == "APL_kg_per_card", "Value"].iloc[0])
-    except Exception:
-        APL_kg = 0.0
+    # eligibility kg settings (optional)
+    def _get_setting_opt(name, default):
+        try:
+            return float(settings.loc[settings["Parameter"] == name, "Value"].iloc[0])
+        except Exception:
+            return float(default)
 
-    # Start_Date (optional). If provided, must be parseable by pandas.to_datetime.
+    AAY_kg = _get_setting_opt("AAY_kg_per_card", 35.0)
+    PHH_kg = _get_setting_opt("PHH_kg_per_beneficiary", 5.0)
+    APL_kg = _get_setting_opt("APL_kg_per_card", 0.0)
+
+    # optional start date for day 1
     try:
-        sd = settings.loc[settings["Parameter"] == "Start_Date", "Value"].iloc[0]
-        start_date = pd.to_datetime(sd)
+        sd_val = settings.loc[settings["Parameter"] == "Start_Date", "Value"].iloc[0]
+        start_date = pd.to_datetime(sd_val)
     except Exception:
         start_date = pd.Timestamp.today().normalize()
 
     # -----------------------------
-    # Build Day -> Date mapping (skip Sundays)
+    # Build day -> date mapping (skip Sundays)
     # -----------------------------
     dates = []
     cur = start_date
-    # keep iterating until we collect DAYS dates that are not Sundays
     while len(dates) < DAYS:
-        # Monday=0 ... Sunday=6
-        if cur.weekday() != 6:  # skip Sundays
+        if cur.weekday() != 6:  # Sunday == 6 -> skip
             dates.append(pd.Timestamp(cur).normalize())
         cur = cur + pd.Timedelta(days=1)
     day_to_date = {i+1: dates[i] for i in range(len(dates))}
 
     # -----------------------------
-    # 1) Prepare LG & FPS mappings
+    # Normalize LG and FPS
     # -----------------------------
     lgs = lgs.copy()
     if "LG_ID" not in lgs.columns or "LG_Name" not in lgs.columns:
@@ -94,28 +85,25 @@ def run_simulation(
         except Exception:
             return lgid_by_name.get(s.lower())
 
+    fps = fps.copy()
+    # required FPS cols (we relax Monthly_Demand_tons but need capacity & link)
     req_cols = {"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
     missing = req_cols - set(fps.columns)
     if missing:
         raise ValueError(f"FPS sheet missing required columns: {missing}")
 
-    fps = fps.copy()
-    # Ensure Lead_Time_days exists and fill NaN with default
+    # ensure lead time
     if "Lead_Time_days" not in fps.columns:
         fps["Lead_Time_days"] = DEFAULT_LEAD
     else:
         fps["Lead_Time_days"] = fps["Lead_Time_days"].fillna(DEFAULT_LEAD)
 
     # -----------------------------
-    # 1a) Compute demand from counts if Monthly_Demand_tons missing
-    # Acceptable FPS count columns (we detect common names):
-    #    AAY_Count  OR AAY_Cards
-    #    PHH_Beneficiaries OR PHH_Count
-    #    APL_Count OR APL_Cards
-    # If Monthly_Demand_tons exists it will be used; otherwise monthly demand derived from counts.
-    # Counts are assumed to be monthly totals (if a different cadence is used, change later).
+    # Compute demand from counts if provided
+    # - Accept columns: AAY_Count/AAY_Cards, PHH_Beneficiaries/PHH_Count, APL_Count/APL_Cards
+    # - Monthly counts are converted to monthly kg using eligibility settings; then to tons
+    # - If Monthly_Demand_tons exists, prefer it; otherwise derive from counts
     # -----------------------------
-    # helper to find column
     def first_col(df, candidates):
         for c in candidates:
             if c in df.columns:
@@ -126,9 +114,7 @@ def run_simulation(
     phh_col = first_col(fps, ["PHH_Beneficiaries", "PHH_Count", "PHH_Beneficiary"])
     apl_col = first_col(fps, ["APL_Count", "APL_Cards"])
 
-    # Build per-FPS monthly demand (kg) from counts if Monthly_Demand_tons absent or NA
-    # If Monthly_Demand_tons exists we'll still compute per-category breakdowns if counts present.
-    # compute counts filled with zeros if missing
+    # create canonical count columns (float)
     fps["AAY_Count"] = fps[aay_col].fillna(0).astype(float) if aay_col is not None else 0.0
     fps["PHH_Count"] = fps[phh_col].fillna(0).astype(float) if phh_col is not None else 0.0
     fps["APL_Count"] = fps[apl_col].fillna(0).astype(float) if apl_col is not None else 0.0
@@ -140,30 +126,25 @@ def run_simulation(
         fps["APL_Count"] * APL_kg
     )
 
-    # If Monthly_Demand_tons present, prefer it; else derive from counts
+    # prefer explicit Monthly_Demand_tons if present; else derive from counts
     if "Monthly_Demand_tons" in fps.columns:
         fps["Monthly_Demand_tons"] = pd.to_numeric(fps["Monthly_Demand_tons"], errors="coerce")
     fps["Monthly_Demand_tons"] = fps.get("Monthly_Demand_tons").fillna(fps["Monthly_from_counts_kg"] / 1000.0)
 
-    # per-category monthly tons (from counts)
+    # per-category monthly tons and daily tons
     fps["AAY_Monthly_tons"] = fps["AAY_Count"] * (AAY_kg / 1000.0)
     fps["PHH_Monthly_tons"] = fps["PHH_Count"] * (PHH_kg / 1000.0)
     fps["APL_Monthly_tons"] = fps["APL_Count"] * (APL_kg / 1000.0)
 
-    # per-category daily tons
     fps["Daily_Demand_tons"] = fps["Monthly_Demand_tons"] / 30.0
     fps["AAY_Daily_tons"] = fps["AAY_Monthly_tons"] / 30.0
     fps["PHH_Daily_tons"] = fps["PHH_Monthly_tons"] / 30.0
     fps["APL_Daily_tons"] = fps["APL_Monthly_tons"] / 30.0
-
-    # NSFA components (AAY + PHH)
     fps["NSFA_Daily_tons"] = fps["AAY_Daily_tons"] + fps["PHH_Daily_tons"]
     fps["NSFA_Monthly_tons"] = fps["AAY_Monthly_tons"] + fps["PHH_Monthly_tons"]
 
-    # Reorder threshold uses total Daily_Demand_tons and Lead_Time_days
     fps["Reorder_Threshold_tons"] = fps["Daily_Demand_tons"] * fps["Lead_Time_days"]
 
-    # Attach LG_ID normalized
     fps["LG_ID"] = fps["Linked_LG_ID"].apply(normalize_lg_ref)
     if fps["LG_ID"].isna().any():
         bad_rows = fps[fps["LG_ID"].isna()][["FPS_ID", "Linked_LG_ID"]]
@@ -174,7 +155,7 @@ def run_simulation(
     fps["LG_ID"] = fps["LG_ID"].astype(int)
 
     # -----------------------------
-    # 2) Prepare Vehicles mapping
+    # Vehicles mapping
     # -----------------------------
     vehicles = vehicles.copy()
     if vehicles.empty:
@@ -220,7 +201,7 @@ def run_simulation(
         )
 
     # -----------------------------
-    # 3) LG → FPS SIMULATION
+    # LG -> FPS simulation
     # -----------------------------
     if "Initial_Allocation_tons" not in lgs.columns:
         lgs["Initial_Allocation_tons"] = 0.0
@@ -232,19 +213,19 @@ def run_simulation(
     stock_rows = []
 
     for day in range(1, DAYS + 1):
-        # 3a) FPS consumes daily demand
+        # a) FPS consume daily demand
         for _, r in fps.iterrows():
             fid = int(r["FPS_ID"])
             fps_stock[fid] = max(0.0, fps_stock[fid] - float(r["Daily_Demand_tons"]))
 
-        # 3b) Compute needs (total demand-driven logic unchanged)
+        # b) compute needs
         needs = []
         for _, r in fps.iterrows():
-            fid  = int(r["FPS_ID"])
+            fid = int(r["FPS_ID"])
             lgid = int(r["LG_ID"])
             current = fps_stock[fid]
             threshold = float(r["Reorder_Threshold_tons"])
-            max_cap  = float(r["Max_Capacity_tons"])
+            max_cap = float(r["Max_Capacity_tons"])
             if current <= threshold:
                 available_at_lg = lg_stock.get(lgid, 0.0)
                 need_qty = min(max_cap - current, available_at_lg)
@@ -253,10 +234,8 @@ def run_simulation(
                     needs.append((urgency, fid, lgid, need_qty))
         needs.sort(reverse=True, key=lambda x: x[0])
 
-        # 3c) Reset vehicle usage counters for the day
         vehicles["Trips_Used"] = 0
 
-        # 3d) Dispatch loop
         for urgency, fid, lgid, need_qty in needs:
             cand = vehicles[vehicles["Mapped_LGs_List"].apply(lambda lst: lgid in lst)].copy()
             cand = cand[cand["Trips_Used"] < MAX_TRIPS]
@@ -273,7 +252,7 @@ def run_simulation(
             if qty <= 0:
                 continue
 
-            # Determine fractional split of delivered qty into AAY/PHH/APL using the FPS per-category daily demands
+            # allocate to categories proportionally to fps per-category daily demand
             r = fps.loc[fps["FPS_ID"] == fid].iloc[0]
             total_d = float(r["Daily_Demand_tons"]) if r["Daily_Demand_tons"] > 0 else 0.0
             aay_d = float(r.get("AAY_Daily_tons", 0.0))
@@ -281,7 +260,6 @@ def run_simulation(
             apl_d = float(r.get("APL_Daily_tons", 0.0))
 
             if total_d <= 0:
-                # If no demand recorded, attribute everything to APL=0 and NSFA=0 (keep 0s)
                 aay_del = phh_del = apl_del = 0.0
             else:
                 aay_del = qty * (aay_d / total_d)
@@ -303,16 +281,15 @@ def run_simulation(
                 "NSFA_tons": float(nsfa_del)
             })
 
-            # update stocks & vehicle usage
             lg_stock[lgid] = lg_stock.get(lgid, 0.0) - qty
             fps_stock[fid] = fps_stock.get(fid, 0.0) + qty
             vehicles.loc[vehicles["Vehicle_ID"] == vid, "Trips_Used"] += 1
 
-        # 3e) Record end-of-day stocks (add Date)
-        for lgid, st in lg_stock.items():
-            stock_rows.append({"Day": int(day), "Date": day_to_date[int(day)], "Entity_Type": "LG",  "Entity_ID": int(lgid), "Stock_Level_tons": float(st)})
-        for fid, st in fps_stock.items():
-            stock_rows.append({"Day": int(day), "Date": day_to_date[int(day)], "Entity_Type": "FPS", "Entity_ID": int(fid),  "Stock_Level_tons": float(st)})
+        # record end-of-day stocks (include Date)
+        for lgid, st_val in lg_stock.items():
+            stock_rows.append({"Day": int(day), "Date": day_to_date[int(day)], "Entity_Type": "LG", "Entity_ID": int(lgid), "Stock_Level_tons": float(st_val)})
+        for fid, st_val in fps_stock.items():
+            stock_rows.append({"Day": int(day), "Date": day_to_date[int(day)], "Entity_Type": "FPS", "Entity_ID": int(fid), "Stock_Level_tons": float(st_val)})
 
     dispatch_lg = pd.DataFrame(dispatch_lg_rows, columns=[
         "Day","Date","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AAY_tons","PHH_tons","APL_tons","NSFA_tons"
@@ -320,10 +297,12 @@ def run_simulation(
     stock_levels = pd.DataFrame(stock_rows, columns=["Day","Date","Entity_Type","Entity_ID","Stock_Level_tons"])
 
     if dispatch_lg.empty:
-        dispatch_lg = pd.DataFrame(columns=["Day","Date","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AAY_tons","PHH_tons","APL_tons","NSFA_tons"])
+        dispatch_lg = pd.DataFrame(columns=[
+            "Day","Date","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AAY_tons","PHH_tons","APL_tons","NSFA_tons"
+        ])
 
     # -----------------------------------------------
-    # 4) Derive LG daily requirement from dispatch_lg
+    # Derive LG daily requirement from dispatch_lg
     # -----------------------------------------------
     required_cols = {"LG_ID", "Day", "Quantity_tons"}
     missing = required_cols - set(dispatch_lg.columns)
@@ -345,42 +324,24 @@ def run_simulation(
             .rename(columns={"Quantity_tons": "Daily_Requirement_tons"})
         )
 
-    req_pivot = lg_daily_req.pivot_table(
-        index="LG_ID", columns="Day",
-        values="Daily_Requirement_tons",
-        aggfunc="sum", fill_value=0.0
-    )
+    req_pivot = lg_daily_req.pivot_table(index="LG_ID", columns="Day", values="Daily_Requirement_tons", aggfunc="sum", fill_value=0.0)
 
-    # Also build LG-level per-category demand pivot (AAY/PHH/APL) from fps definition:
-    # sum of per-FPS AAY/PHH/APL daily demand grouped by LG
+    # Build LG per-category daily demands by aggregating FPS category daily demands
     fps_cats = fps[["LG_ID", "AAY_Daily_tons", "PHH_Daily_tons", "APL_Daily_tons", "Daily_Demand_tons"]].copy()
     fps_cats["LG_ID"] = fps_cats["LG_ID"].astype(int)
-
     lg_cat = fps_cats.groupby("LG_ID").sum().reindex(index=sorted(valid_lg_ids), fill_value=0.0)
-    # But we need per-day breakdown (for CG scheduling): use the fps per-FPS per-day values and expand over days (constant across days)
-    # so LG per-day AAY/PHH/APL demand = per-LG total daily from fps (constant each day)
-    # Build pivot frames where each Day column contains the per-LG daily category demand
+
     lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
     days_list = list(range(1, DAYS + 1))
 
-    lg_aay_piv = pd.DataFrame(
-        {d: lg_cat["AAY_Daily_tons"].values for d in days_list},
-        index=lg_cat.index
-    ).reindex(index=lg_ids_sorted, fill_value=0.0)
-
-    lg_phh_piv = pd.DataFrame(
-        {d: lg_cat["PHH_Daily_tons"].values for d in days_list},
-        index=lg_cat.index
-    ).reindex(index=lg_ids_sorted, fill_value=0.0)
-
-    lg_apl_piv = pd.DataFrame(
-        {d: lg_cat["APL_Daily_tons"].values for d in days_list},
-        index=lg_cat.index
-    ).reindex(index=lg_ids_sorted, fill_value=0.0)
+    lg_aay_piv = pd.DataFrame({d: lg_cat["AAY_Daily_tons"].values for d in days_list}, index=lg_cat.index).reindex(index=lg_ids_sorted, fill_value=0.0)
+    lg_phh_piv = pd.DataFrame({d: lg_cat["PHH_Daily_tons"].values for d in days_list}, index=lg_cat.index).reindex(index=lg_ids_sorted, fill_value=0.0)
+    lg_apl_piv = pd.DataFrame({d: lg_cat["APL_Daily_tons"].values for d in days_list}, index=lg_cat.index).reindex(index=lg_ids_sorted, fill_value=0.0)
 
     # -----------------------------------------------
-    # 5) CG → LG PRE-DISPATCH (same DAYS timeline)
+    # CG -> LG pre-dispatch (uses derived requirements)
     # -----------------------------------------------
+    # capacity: prefer LG_Capacity sheet, fallback to Storage_Capacity_tons in LGs
     try:
         cap_df = pd.read_excel(master_workbook, sheet_name="LG_Capacity")
         if {"LG_ID", "Capacity_tons"} <= set(cap_df.columns):
@@ -405,7 +366,6 @@ def run_simulation(
             return 0.0
 
     def _get_cat_demand(lg_id: int, day: int):
-        # return (aay, phh, apl) daily demand for this lg/day (we use the constant daily per-LG values)
         a = float(lg_aay_piv.at[lg_id, day]) if (lg_id in lg_aay_piv.index and day in lg_aay_piv.columns) else 0.0
         p = float(lg_phh_piv.at[lg_id, day]) if (lg_id in lg_phh_piv.index and day in lg_phh_piv.columns) else 0.0
         l = float(lg_apl_piv.at[lg_id, day]) if (lg_id in lg_apl_piv.index and day in lg_apl_piv.columns) else 0.0
@@ -416,14 +376,14 @@ def run_simulation(
 
     def _simulate(pre_days: int, collect_rows: bool = False, include_pre_days: bool = False):
         start_day = 1 - pre_days
-        stock = {lg: lg_stock_base.get(lg, 0.0) for lg in lg_ids}
+        stock = {lg: lg_stock_base.get(lg, 0.0) for lg in lg_ids_sorted}
         rows = [] if collect_rows else None
 
         for day in range(start_day, DAYS + 1):
             trips_left = TOT_V
 
             if day >= 1:
-                order = sorted(lg_ids, key=lambda lg: -(_get_demand(lg, day) - stock[lg]))
+                order = sorted(lg_ids_sorted, key=lambda lg: -(_get_demand(lg, day) - stock[lg]))
                 for lg in order:
                     demand_today = _get_demand(lg, day)
                     need_today = max(0.0, demand_today - stock[lg])
@@ -436,7 +396,6 @@ def run_simulation(
                         if qty <= 1e-9:
                             break
 
-                        # compute category split for this LG/day
                         aay_d, phh_d, apl_d = _get_cat_demand(lg, day)
                         total_cat = aay_d + phh_d + apl_d
                         if total_cat <= 0:
@@ -467,11 +426,11 @@ def run_simulation(
                     if stock[lg] + 1e-6 < demand_today:
                         return False, (rows or []), start_day, stock
 
-            # B) Pre-stock round-robin with remaining trips
+            # pre-stock
             if trips_left > 0:
                 future_unmet = {
                     lg: max(0.0, sum(_get_demand(lg, d) for d in range(max(1, day + 1), DAYS + 1)) - stock[lg])
-                    for lg in lg_ids
+                    for lg in lg_ids_sorted
                 }
                 candidates = [lg for lg, fu in future_unmet.items() if fu > 1e-6 and _free_room(stock, lg) > 1e-6]
                 idx = 0
@@ -481,7 +440,6 @@ def run_simulation(
                     deliver = min(TRUCK_CAP, future_unmet[lg], room)
 
                     if deliver > 1e-9:
-                        # category split for pre-stocking delivery (same method)
                         aay_d, phh_d, apl_d = _get_cat_demand(lg, day)
                         total_cat = aay_d + phh_d + apl_d
                         if total_cat <= 0:
@@ -514,7 +472,7 @@ def run_simulation(
                     idx += 1
 
             if day >= 1:
-                for lg in lg_ids:
+                for lg in lg_ids_sorted:
                     stock[lg] = max(0.0, stock[lg] - _get_demand(lg, day))
 
         return True, (rows or []), start_day, stock
@@ -535,7 +493,7 @@ def run_simulation(
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day","Date","Vehicle_ID","LG_ID","Quantity_tons","AAY_tons","PHH_tons","APL_tons","NSFA_tons"])
 
-    # === Accurate LG stock levels, include pre-days as before ===
+    # Build accurate LG stock levels (include pre-days)
     lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
 
     if "Initial_LG_stock" in lgs.columns:
@@ -547,24 +505,24 @@ def run_simulation(
     else:
         init_series = pd.Series(0.0, index=lg_ids_sorted)
 
+    # CG cumulative receipts (include pre-days)
     if not dispatch_cg.empty:
         dcg = dispatch_cg.copy()
         dcg["LG_ID"] = dcg["LG_ID"].astype(int)
-        dcg["Day"]   = dcg["Day"].astype(int)
-        cg_piv = dcg.pivot_table(index="LG_ID", columns="Day",
-                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        dcg["Day"] = dcg["Day"].astype(int)
+        cg_piv = dcg.pivot_table(index="LG_ID", columns="Day", values="Quantity_tons", aggfunc="sum", fill_value=0.0)
         full_cols = list(range(start_day, DAYS + 1))
         cg_piv = cg_piv.reindex(index=lg_ids_sorted, columns=full_cols, fill_value=0.0)
         cg_cum = cg_piv.cumsum(axis=1).reindex(columns=list(range(1, DAYS + 1)), fill_value=0.0)
     else:
         cg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
 
+    # LG->FPS cumulative (from dispatch_lg)
     if not dispatch_lg.empty:
         dlg = dispatch_lg.copy()
         dlg["LG_ID"] = dlg["LG_ID"].astype(int)
-        dlg["Day"]   = dlg["Day"].astype(int)
-        lg_piv = dlg.pivot_table(index="LG_ID", columns="Day",
-                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        dlg["Day"] = dlg["Day"].astype(int)
+        lg_piv = dlg.pivot_table(index="LG_ID", columns="Day", values="Quantity_tons", aggfunc="sum", fill_value=0.0)
         lg_piv = lg_piv.reindex(index=lg_ids_sorted, columns=list(range(1, DAYS + 1)), fill_value=0.0)
         lg_cum = lg_piv.cumsum(axis=1)
     else:
@@ -575,12 +533,13 @@ def run_simulation(
 
     lg_stock_levels = (
         pd.DataFrame(stock_matrix, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
-          .stack().rename("Stock_Level_tons")
-          .rename_axis(index=["LG_ID", "Day"]).reset_index()
-          .rename(columns={"LG_ID": "Entity_ID"})
-          .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+            .stack().rename("Stock_Level_tons")
+            .rename_axis(index=["LG_ID", "Day"]).reset_index()
+            .rename(columns={"LG_ID": "Entity_ID"})
+            .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
     )
 
+    # pre-day LG stocks (start_day .. 0)
     pre_cols = list(range(start_day, 1))
     if pre_cols:
         if not dispatch_cg.empty:
@@ -594,24 +553,27 @@ def run_simulation(
 
         lg_stock_levels_pre = (
             pd.DataFrame(stock_pre_matrix, index=lg_ids_sorted, columns=pre_cols)
-              .stack().rename("Stock_Level_tons")
-              .rename_axis(index=["LG_ID", "Day"]).reset_index()
-              .rename(columns={"LG_ID": "Entity_ID"})
-              .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+                .stack().rename("Stock_Level_tons")
+                .rename_axis(index=["LG_ID", "Day"]).reset_index()
+                .rename(columns={"LG_ID": "Entity_ID"})
+                .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
         )
+    else:
+        lg_stock_levels_pre = pd.DataFrame(columns=["Day","Entity_Type","Entity_ID","Stock_Level_tons"])
 
     lg_stock_levels = pd.concat([lg_stock_levels_pre, lg_stock_levels], ignore_index=True)
-    # Add Date column for stock_levels using day_to_date (if day exists)
     lg_stock_levels["Date"] = lg_stock_levels["Day"].apply(lambda d: day_to_date.get(int(d), pd.NaT))
 
-    # ensure stock_levels (FPS rows) also have Date (we already added above)
+    # ensure stock_levels FPS rows have Date already
     if "Date" not in stock_levels.columns:
         stock_levels["Date"] = stock_levels["Day"].apply(lambda d: day_to_date.get(int(d), pd.NaT))
 
+    # merge fps rows + lg rows
     stock_levels = pd.concat(
         [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels[["Day","Date","Entity_Type","Entity_ID","Stock_Level_tons"]].rename(columns={"Entity_ID":"Entity_ID"})],
         ignore_index=True
     )
 
-    # Ensure dispatch_lg and dispatch_cg contain the category columns and Date column
+    # keep consistent column ordering (rename Entity_ID -> Entity_ID for uniformity)
+    # For compatibility with app, keep column names: Day, Date, Entity_Type, Entity_ID, Stock_Level_tons
     return dispatch_cg, dispatch_lg, stock_levels
