@@ -1,278 +1,334 @@
-# app1.py
-import os
-from io import BytesIO
-import streamlit as st
+# simulation.py
+
+import streamlit
+import io
 import pandas as pd
+import math
+import numpy as np
 
-from simulation import run_simulation  # make sure simulation.py is alongside this file
+def run_simulation(
+    master_workbook,          # str path or file-like buffer
+    settings: pd.DataFrame,
+    lgs: pd.DataFrame,
+    fps: pd.DataFrame,
+    vehicles: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Runs a two-phase simulation with category-aware demand:
+      - derives FPS demand from counts OR uses Monthly_Demand_tons override when provided
+      - splits each dispatch into AAY_tons, PHH_tons, APL_tons and NFSA_tons (AAY+PHH)
+    Returns: (dispatch_cg, dispatch_lg, stock_levels)
+    """
 
-st.set_page_config(page_title="Grain Distribution Simulator", layout="wide")
-st.title("🚛 Grain Distribution Simulator")
-
-# ---------------------------
-# Helpers
-# ---------------------------
-REQUIRED_SHEETS = ["Settings", "LGs", "FPS"]  # Vehicles is optional
-
-def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
-    """Write multiple DataFrames (sheet_name -> df) into one Excel bytes object."""
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        for name, df in sheets.items():
-            # Ensure DataFrame even if None
-            (df if df is not None else pd.DataFrame()).to_excel(w, sheet_name=name, index=False)
-    buf.seek(0)
-    return buf.getvalue()
-
-def template_workbook() -> bytes:
-    """Return a minimal template workbook with correct headers."""
-    settings = pd.DataFrame({
-        "Parameter": [
-            "Distribution_Days",
-            "Vehicle_Capacity_tons",
-            "Vehicles_Total",
-            "Max_Trips_Per_Vehicle_Per_Day",
-            "Default_Lead_Time_days",
-            "Start_Date",  # YYYY-MM-DD start date for timeline (optional)
-            "AAY_kg_per_card",
-            "PHH_kg_per_beneficiary",
-            "APL_kg_per_card",
-        ],
-        "Value": [30, 11.5, 30, 3, 3, pd.Timestamp.today().strftime("%Y-%m-%d"), 35.0, 5.0, 2.5],
-    })
-
-    lgs = pd.DataFrame({
-        "LG_ID": [1, 2],
-        "LG_Name": ["LG_A", "LG_B"],
-        "Storage_Capacity_tons": [500.0, 400.0],
-        "Initial_Allocation_tons": [0.0, 0.0],
-        "Initial_LG_stock": [0.0, 0.0],
-    })
-
-    fps = pd.DataFrame({
-        "FPS_ID": [101, 102, 201],
-        "FPS_Name": ["Shop_101", "Shop_102", "Shop_201"],
-        # we'll compute Monthly_Demand_tons from the counts below
-        "AAY_Count": [1000, 500, 800],
-        "PHH_Beneficiaries": [200, 100, 50],
-        "APL_Count": [50, 30, 20],
-        "Max_Capacity_tons": [40.0, 30.0, 35.0],
-        # Can be LG_ID (1/2) or LG_Name ("LG_A"/"LG_B")
-        "Linked_LG_ID": ["LG_A", "LG_B", "LG_A"],
-        # Optional; if omitted, defaults to settings["Default_Lead_Time_days"]
-        "Lead_Time_days": [3, None, 2],
-    })
-
-    vehicles = pd.DataFrame({
-        "Vehicle_ID": [1, 2, 3, 4, 5],
-        "Capacity_tons": [11.5, 11.5, 11.5, 11.5, 11.5],
-        "Mapped_LG_IDs": ["LG_A,LG_B", "LG_A", "LG_B", "1,2", "LG_A"],
-    })
-
-    return to_excel({
-        "Settings": settings,
-        "LGs": lgs,
-        "FPS": fps,
-        "Vehicles": vehicles,
-        "LG_Capacity": pd.DataFrame({"LG_ID": [1, 2], "Capacity_tons": [500.0, 400.0]}),
-    })
-
-def read_sheet(xls_obj, sheet, required_cols=None) -> pd.DataFrame:
-    """Read a sheet and optionally validate columns; raise ValueError with a friendly message."""
-    try:
-        df = pd.read_excel(xls_obj, sheet_name=sheet)
-    except ValueError as e:
-        raise ValueError(f"Worksheet named '{sheet}' not found.") from e
-    if required_cols:
-        missing = set(required_cols) - set(df.columns)
-        if missing:
-            raise ValueError(f"Sheet '{sheet}' is missing required columns: {sorted(missing)}")
-    return df
-
-@st.cache_data
-def load_inputs(src):
-    """Load required inputs from uploaded file or path; Vehicles is optional."""
-    # We re-open a BytesIO because ExcelFile keeps a read pointer.
-    data = src.read() if hasattr(src, "read") else open(src, "rb").read()
-    xls = BytesIO(data)
-
-    settings = read_sheet(
-        xls, "Settings",
-        required_cols={"Parameter", "Value"}
-    )
-    xls.seek(0)
-    lgs = read_sheet(
-        xls, "LGs",
-        required_cols={"LG_ID", "LG_Name"}
-    )
-    xls.seek(0)
-    fps = read_sheet(
-        xls, "FPS",
-        required_cols={"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
-    )
-    xls.seek(0)
-    try:
-        vehicles = read_sheet(
-            xls, "Vehicles",
-            required_cols={"Vehicle_ID"}  # Capacity_tons & Mapped_LG_IDs are optional
-        )
-    except ValueError:
-        vehicles = pd.DataFrame(columns=["Vehicle_ID", "Capacity_tons", "Mapped_LG_IDs"])
-
-    # --- derive Monthly_Demand_tons from RC counts automatically ---
-    # Determine settings for eligibilities
-    def _get_setting_param(s_df, name, default):
+    # -----------------------------
+    # 0) Read key parameters safely
+    # -----------------------------
+    def _get_setting(param_name, default=None, cast=float):
         try:
-            return float(s_df.loc[s_df["Parameter"] == name, "Value"].iloc[0])
+            val = settings.loc[settings["Parameter"] == param_name, "Value"].iloc[0]
+            return cast(val)
         except Exception:
-            return float(default)
+            if default is None:
+                raise ValueError(f"Missing required setting: {param_name}")
+            return cast(default)
 
-    AAY_kg = _get_setting_param(settings, "AAY_kg_per_card", 35.0)
-    PHH_kg = _get_setting_param(settings, "PHH_kg_per_beneficiary", 5.0)
-    APL_kg = _get_setting_param(settings, "APL_kg_per_card", 0.0)
+    DAYS       = _get_setting("Distribution_Days", default=30, cast=int)
+    TRUCK_CAP  = _get_setting("Vehicle_Capacity_tons", default=11.5, cast=float)
+    TOT_V      = _get_setting("Vehicles_Total", default=30, cast=int)
+    MAX_TRIPS  = _get_setting("Max_Trips_Per_Vehicle_Per_Day", default=3, cast=int)
+    DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", default=3, cast=float)
 
-    # normalize/ensure count columns exist
+    # category eligibility (kg)
+    AAY_kg = _get_setting("AAY_kg_per_card", 35.0, float)
+    PHH_kg = _get_setting("PHH_kg_per_beneficiary", 5.0, float)
+    APL_kg = _get_setting("APL_kg_per_card", 0.0, float)
+
+    # The maximum number of pre-days we may try when searching feasibility
+    MAX_PRE_DAYS = 30
+
+    # -----------------------------
+    # Date mapping (cover pre-days too), skip Sundays
+    # -----------------------------
+    # Optional "Start_Date" setting (YYYY-MM-DD); fallback to today.
+    start_date_val = None
+    try:
+        start_date_val = settings.loc[settings["Parameter"] == "Start_Date", "Value"].iloc[0]
+    except Exception:
+        start_date_val = None
+
+    if pd.notna(start_date_val):
+        try:
+            start_date = pd.to_datetime(start_date_val).normalize()
+        except Exception:
+            start_date = pd.Timestamp.today().normalize()
+    else:
+        start_date = pd.Timestamp.today().normalize()
+
+    # If start_date is Sunday, shift forward to next non-Sunday
+    while start_date.weekday() == 6:  # Sunday == 6
+        start_date += pd.Timedelta(days=1)
+
+    # Forward dates for day 1..DAYS (excluding Sundays)
+    forward_dates = []
+    cur = start_date
+    while len(forward_dates) < DAYS:
+        if cur.weekday() != 6:
+            forward_dates.append(cur.date())
+        cur += pd.Timedelta(days=1)
+
+    # Backward dates for day 0, -1, -2, ... (excluding Sundays)
+    backward_dates = []
+    cur = start_date - pd.Timedelta(days=1)
+    while len(backward_dates) < MAX_PRE_DAYS:
+        if cur.weekday() != 6:
+            backward_dates.append(cur.date())  # backward_dates[0] -> day 0
+        cur -= pd.Timedelta(days=1)
+
+    # Build day_to_date mapping with fallback coverage
+    day_to_date = {}
+    for i, dt in enumerate(forward_dates, start=1):
+        day_to_date[i] = dt
+    for idx, dt in enumerate(backward_dates):
+        day_to_date[0 - idx] = dt
+
+    # -----------------------------
+    # 1) Prepare LG & FPS mappings
+    # -----------------------------
+    lgs = lgs.copy()
+    if "LG_ID" not in lgs.columns or "LG_Name" not in lgs.columns:
+        raise ValueError("LGs sheet must contain columns: LG_ID, LG_Name")
+
+    lgid_by_name = {str(nm).strip().lower(): int(lg_id) for lg_id, nm in zip(lgs["LG_ID"], lgs["LG_Name"])}
+    valid_lg_ids = set(int(x) for x in lgs["LG_ID"])
+
+    def normalize_lg_ref(val):
+        if pd.isna(val):
+            return None
+        s = str(val).strip()
+        try:
+            i = int(float(s))
+            return i if i in valid_lg_ids else None
+        except Exception:
+            return lgid_by_name.get(s.lower())
+
+    # Validate FPS required columns exist (Monthly_Demand_tons may be missing but column not required here)
+    req_cols = {"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
+    missing = req_cols - set(fps.columns)
+    if missing:
+        raise ValueError(f"FPS sheet missing required columns: {missing}")
+
     fps = fps.copy()
-    fps["AAY_Count"] = fps.get("AAY_Count", 0).fillna(0).astype(float)
-    fps["PHH_Beneficiaries"] = fps.get("PHH_Beneficiaries", 0).fillna(0).astype(float)
-    fps["APL_Count"] = fps.get("APL_Count", 0).fillna(0).astype(float)
+    # Ensure Lead_Time_days exists and fill NaN with default
+    if "Lead_Time_days" not in fps.columns:
+        fps["Lead_Time_days"] = DEFAULT_LEAD
+    else:
+        fps["Lead_Time_days"] = fps["Lead_Time_days"].fillna(DEFAULT_LEAD)
 
-    # compute monthly demand (kg -> tons). User requested monthly demand = counts * eligibility (kgs) converted to tons.
-    fps["Monthly_from_counts_kg"] = fps["AAY_Count"] * AAY_kg + fps["PHH_Beneficiaries"] * PHH_kg + fps["APL_Count"] * APL_kg
-    fps["Monthly_Demand_tons"] = fps.get("Monthly_Demand_tons")
-    fps["Monthly_Demand_tons"] = pd.to_numeric(fps["Monthly_Demand_tons"], errors="coerce")
-    # override or fill with computed value — user said they will not enter demand, so prefer derived value
-    fps["Monthly_Demand_tons"] = (fps["Monthly_from_counts_kg"] / 1000.0).fillna(0.0)
+    # counts columns: ensure present and numeric
+    fps["AAY_Count"] = pd.to_numeric(fps.get("AAY_Count", 0), errors="coerce").fillna(0.0)
+    fps["PHH_Beneficiaries"] = pd.to_numeric(fps.get("PHH_Beneficiaries", 0), errors="coerce").fillna(0.0)
+    fps["APL_Count"] = pd.to_numeric(fps.get("APL_Count", 0), errors="coerce").fillna(0.0)
 
-    return settings, lgs, fps, vehicles
-
-# ---------------------------
-# Sidebar: template download
-# ---------------------------
-with st.sidebar:
-    st.subheader("📄 Template")
-    st.download_button(
-        "Download input template (Excel)",
-        data=template_workbook(),
-        file_name="grain_simulator_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
+    # compute counts-derived monthly kg
+    fps["Monthly_from_counts_kg"] = (
+        fps["AAY_Count"] * AAY_kg
+        + fps["PHH_Beneficiaries"] * PHH_kg
+        + fps["APL_Count"] * APL_kg
     )
 
-# ---------------------------
-# Upload or fallback to local
-# ---------------------------
-uploaded = st.file_uploader("Upload master workbook (.xlsx)", type="xlsx")
-if uploaded is not None:
-    master = uploaded
-elif os.path.exists("grain_simulator_template.xlsx"):
-    master = "grain_simulator_template.xlsx"
-else:
-    st.warning("Please upload an Excel file using the button above, or place 'grain_simulator_template.xlsx' in the working directory.")
-    st.stop()
+    # Monthly_Demand_tons: if user provided positive value -> use it; otherwise use counts-derived
+    fps["Monthly_Demand_tons"] = pd.to_numeric(fps.get("Monthly_Demand_tons", pd.NA), errors="coerce")
+    counts_derived_tons = (fps["Monthly_from_counts_kg"] / 1000.0).fillna(0.0)
+    fps["Monthly_Demand_tons"] = fps["Monthly_Demand_tons"].where(fps["Monthly_Demand_tons"].notna() & (fps["Monthly_Demand_tons"] > 0), counts_derived_tons)
+    fps["Daily_Demand_tons"] = fps["Monthly_Demand_tons"] / 30.0
+    fps["Reorder_Threshold_tons"] = fps["Daily_Demand_tons"] * fps["Lead_Time_days"]
 
-# ---------------------------
-# Load & preview inputs
-# ---------------------------
-try:
-    settings, lgs, fps, vehicles = load_inputs(master)
-except Exception as e:
-    st.error(f"❌ Could not load inputs: {e}")
-    st.stop()
-
-with st.expander("🔍 Preview Inputs", expanded=False):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Settings")
-        st.dataframe(settings, use_container_width=True)
-        st.subheader("LGs")
-        st.dataframe(lgs, use_container_width=True)
-    with c2:
-        st.subheader("FPS (counts-derived demand)")
-        st.dataframe(fps, use_container_width=True)
-        st.subheader("Vehicles")
-        st.dataframe(vehicles, use_container_width=True)
-
-# ---------------------------
-# Run simulation
-# ---------------------------
-if st.button("▶️ Run Simulation", use_container_width=True):
-    try:
-        with st.spinner("Running simulation…"):
-            dispatch_cg, dispatch_lg, stock_levels = run_simulation(
-                master, settings, lgs, fps, vehicles
-            )
-        st.success("✅ Simulation complete")
-
-        # Ensure Date column exists on outputs (in case simulation wasn't updated)
-        # Derive from Settings.Start_Date if missing (same exclusion of Sundays)
-        def ensure_dates_present(df, settings_df):
-            if "Date" in df.columns and not df["Date"].isnull().all():
-                return df
-            # build mapping from Start_Date
-            try:
-                start_date_val = settings_df.loc[settings_df["Parameter"] == "Start_Date", "Value"].iloc[0]
-            except Exception:
-                start_date_val = None
-            if pd.notna(start_date_val):
-                try:
-                    start_dt = pd.to_datetime(start_date_val).normalize()
-                except Exception:
-                    start_dt = pd.Timestamp.today().normalize()
-            else:
-                start_dt = pd.Timestamp.today().normalize()
-            while start_dt.weekday() == 6:
-                start_dt += pd.Timedelta(days=1)
-            day_to_date = {}
-            cur = start_dt
-            for d in range(1, int(settings_df.loc[settings_df["Parameter"] == "Distribution_Days", "Value"].iloc[0]) + 1):
-                if cur.weekday() != 6:
-                    day_to_date[d] = cur.date()
-                else:
-                    # skip Sundays by advancing until non-Sunday and account in mapping
-                    while cur.weekday() == 6:
-                        cur += pd.Timedelta(days=1)
-                    day_to_date[d] = cur.date()
-                cur += pd.Timedelta(days=1)
-            if "Day" in df.columns:
-                df = df.copy()
-                df["Date"] = df["Day"].apply(lambda d: day_to_date.get(int(d)))
-            return df
-
-        dispatch_lg = ensure_dates_present(dispatch_lg, settings)
-        dispatch_cg = ensure_dates_present(dispatch_cg, settings)
-        stock_levels = ensure_dates_present(stock_levels, settings)
-
-        # Previews
-        with st.expander("👀 Preview Results", expanded=False):
-            st.subheader("LG → FPS (dispatch_lg)")
-            st.dataframe(dispatch_lg, use_container_width=True, height=240)
-            st.subheader("CG → LG (dispatch_cg)")
-            st.dataframe(dispatch_cg, use_container_width=True, height=240)
-            st.subheader("Stock Levels")
-            st.dataframe(stock_levels, use_container_width=True, height=240)
-
-        # Package for download
-        output_sheets = {
-            "Settings":     settings,
-            "LGs":          lgs,
-            "FPS":          fps,
-            "Vehicles":     vehicles,
-            "LG_to_FPS":    dispatch_lg,     # keep clear names
-            "CG_to_LG":     dispatch_cg,
-            "Stock_Levels": stock_levels,
-        }
-        excel_bytes = to_excel(output_sheets)
-
-        st.download_button(
-            label="📥 Download simulation_output.xlsx",
-            data=excel_bytes,
-            file_name="simulation_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+    fps["LG_ID"] = fps["Linked_LG_ID"].apply(normalize_lg_ref)
+    if fps["LG_ID"].isna().any():
+        bad_rows = fps[fps["LG_ID"].isna()][["FPS_ID", "Linked_LG_ID"]]
+        raise ValueError(
+            "Some FPS rows couldn't map Linked_LG_ID to a valid LG_ID. "
+            f"Examples:\n{bad_rows.head(5).to_string(index=False)}"
         )
-    except Exception as e:
-        st.error("❌ Simulation failed.")
-        st.exception(e)
-else:
-    st.info("Upload your workbook above, review inputs, then click ▶️ Run Simulation.")
+    fps["LG_ID"] = fps["LG_ID"].astype(int)
+
+    # -----------------------------
+    # 2) Vehicles mapping
+    # -----------------------------
+    vehicles = vehicles.copy()
+    if vehicles.empty:
+        vehicles = pd.DataFrame({
+            "Vehicle_ID": list(range(1, TOT_V + 1)),
+            "Capacity_tons": [TRUCK_CAP] * TOT_V,
+            "Mapped_LG_IDs": [",".join(str(x) for x in sorted(valid_lg_ids))] * TOT_V
+        })
+    else:
+        if "Vehicle_ID" not in vehicles.columns:
+            raise ValueError("Vehicles sheet must contain 'Vehicle_ID'")
+        if "Capacity_tons" not in vehicles.columns:
+            vehicles["Capacity_tons"] = TRUCK_CAP
+        if "Mapped_LG_IDs" not in vehicles.columns:
+            vehicles["Mapped_LG_IDs"] = ",".join(str(x) for x in sorted(valid_lg_ids))
+
+    def parse_lg_list(val):
+        if pd.isna(val):
+            return []
+        out = []
+        for token in str(val).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                i = int(float(token))
+                if i in valid_lg_ids:
+                    out.append(i)
+                    continue
+            except Exception:
+                pass
+            mapped = normalize_lg_ref(token)
+            if mapped is not None:
+                out.append(mapped)
+        return sorted(set(out))
+
+    vehicles["Mapped_LGs_List"] = vehicles["Mapped_LG_IDs"].apply(parse_lg_list)
+    if vehicles["Mapped_LGs_List"].apply(len).eq(0).any():
+        bad = vehicles[vehicles["Mapped_LGs_List"].apply(len).eq(0)][["Vehicle_ID", "Mapped_LG_IDs"]]
+        raise ValueError(
+            "Some vehicles couldn't map any LGs from 'Mapped_LG_IDs'. "
+            f"Examples:\n{bad.head(5).to_string(index=False)}"
+        )
+
+    # -----------------------------
+    # 3) LG -> FPS simulation
+    # -----------------------------
+    if "Initial_Allocation_tons" not in lgs.columns:
+        lgs["Initial_Allocation_tons"] = 0.0
+
+    lg_stock = {int(row["LG_ID"]): float(row["Initial_Allocation_tons"]) for _, row in lgs.iterrows()}
+    fps_stock = {int(fid): 0.0 for fid in fps["FPS_ID"]}
+
+    dispatch_lg_rows = []
+    stock_rows = []
+
+    # Precompute FPS composition fractions (based on counts if available)
+    # Use counts-derived kg (Monthly_from_counts_kg) to compute fractions; if all zero -> fractions zero.
+    fps_comp = {}
+    for _, r in fps.iterrows():
+        fid = int(r["FPS_ID"])
+        total_kg = float(r.get("Monthly_from_counts_kg", 0.0))
+        if total_kg > 0:
+            aay_kg = float(r.get("AAY_Count", 0.0)) * AAY_kg
+            phh_kg = float(r.get("PHH_Beneficiaries", 0.0)) * PHH_kg
+            apl_kg = float(r.get("APL_Count", 0.0)) * APL_kg
+            # guard: if small mismatch due to rounding, normalize
+            s = aay_kg + phh_kg + apl_kg
+            if s <= 0:
+                aay_frac = phh_frac = apl_frac = 0.0
+            else:
+                aay_frac = aay_kg / s
+                phh_frac = phh_kg / s
+                apl_frac = apl_kg / s
+        else:
+            aay_frac = phh_frac = apl_frac = 0.0
+        fps_comp[fid] = {"AAY_frac": aay_frac, "PHH_frac": phh_frac, "APL_frac": apl_frac}
+
+    for day in range(1, DAYS + 1):
+        # consumption
+        for _, r in fps.iterrows():
+            fid = int(r["FPS_ID"])
+            fps_stock[fid] = max(0.0, fps_stock[fid] - float(r["Daily_Demand_tons"]))
+
+        needs = []
+        for _, r in fps.iterrows():
+            fid  = int(r["FPS_ID"])
+            lgid = int(r["LG_ID"])
+            current = fps_stock[fid]
+            threshold = float(r["Reorder_Threshold_tons"])
+            max_cap  = float(r["Max_Capacity_tons"])
+            if current <= threshold:
+                available_at_lg = lg_stock.get(lgid, 0.0)
+                need_qty = min(max_cap - current, available_at_lg)
+                if need_qty > 0:
+                    urgency = (threshold - current) / float(r["Daily_Demand_tons"]) if r["Daily_Demand_tons"] > 0 else 0
+                    needs.append((urgency, fid, lgid, need_qty))
+        needs.sort(reverse=True, key=lambda x: x[0])
+
+        vehicles["Trips_Used"] = 0
+
+        for urgency, fid, lgid, need_qty in needs:
+            cand = vehicles[vehicles["Mapped_LGs_List"].apply(lambda lst: lgid in lst)].copy()
+            cand = cand[cand["Trips_Used"] < MAX_TRIPS]
+            if cand.empty:
+                continue
+
+            cand["is_shared"] = cand["Mapped_LGs_List"].apply(lambda lst: len(lst) > 1)
+            cand = cand.sort_values(["is_shared"], ascending=False)
+            chosen = cand.iloc[0]
+
+            vid = chosen["Vehicle_ID"]
+            cap = float(chosen["Capacity_tons"])
+            qty = min(cap, need_qty, lg_stock.get(lgid, 0.0))
+            if qty <= 0:
+                continue
+
+            # compute category split using fps_comp fractions for that FPS
+            comp = fps_comp.get(fid, {"AAY_frac": 0.0, "PHH_frac": 0.0, "APL_frac": 0.0})
+            aay_tons = qty * comp["AAY_frac"]
+            phh_tons = qty * comp["PHH_frac"]
+            apl_tons = qty * comp["APL_frac"]
+            nfsa_tons = aay_tons + phh_tons
+
+            # safe date lookup
+            row_date = day_to_date.get(int(day), start_date.date())
+
+            dispatch_lg_rows.append({
+                "Day": int(day),
+                "Date": row_date,
+                "Vehicle_ID": vid,
+                "LG_ID": int(lgid),
+                "FPS_ID": int(fid),
+                "Quantity_tons": float(qty),
+                "AAY_tons": float(aay_tons),
+                "PHH_tons": float(phh_tons),
+                "APL_tons": float(apl_tons),
+                "NFSA_tons": float(nfsa_tons)
+            })
+
+            lg_stock[lgid] = lg_stock.get(lgid, 0.0) - qty
+            fps_stock[fid] = fps_stock.get(fid, 0.0) + qty
+            vehicles.loc[vehicles["Vehicle_ID"] == vid, "Trips_Used"] += 1
+
+        # record end-of-day stocks (use safe date lookup)
+        for lgid, st in lg_stock.items():
+            stock_rows.append({
+                "Day": int(day),
+                "Date": day_to_date.get(int(day), start_date.date()),
+                "Entity_Type": "LG",
+                "Entity_ID": int(lgid),
+                "Stock_Level_tons": float(st)
+            })
+        for fid, st in fps_stock.items():
+            stock_rows.append({
+                "Day": int(day),
+                "Date": day_to_date.get(int(day), start_date.date()),
+                "Entity_Type": "FPS",
+                "Entity_ID": int(fid),
+                "Stock_Level_tons": float(st)
+            })
+
+    dispatch_lg = pd.DataFrame(dispatch_lg_rows, columns=[
+        "Day", "Date", "Vehicle_ID", "LG_ID", "FPS_ID", "Quantity_tons",
+        "AAY_tons", "PHH_tons", "APL_tons", "NFSA_tons"
+    ])
+    stock_levels = pd.DataFrame(stock_rows, columns=["Day", "Date", "Entity_Type", "Entity_ID", "Stock_Level_tons"])
+
+    if dispatch_lg.empty:
+        dispatch_lg = pd.DataFrame(columns=[
+            "Day", "Date", "Vehicle_ID", "LG_ID", "FPS_ID", "Quantity_tons",
+            "AAY_tons", "PHH_tons", "APL_tons", "NFSA_tons"
+        ])
+
+    # -----------------------------------------------
+    # 4) Derive LG daily requirement from dispatch_lg
+    # -----------------------------------------------
+    required_co_
