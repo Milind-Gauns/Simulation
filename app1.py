@@ -4,6 +4,7 @@ import os
 from io import BytesIO
 import streamlit as st
 import pandas as pd
+import numpy as np
 
 from simulation import run_simulation  # make sure simulation.py is alongside this file
 
@@ -34,8 +35,12 @@ def template_workbook() -> bytes:
             "Vehicles_Total",
             "Max_Trips_Per_Vehicle_Per_Day",
             "Default_Lead_Time_days",
+            "Start_Date",  # YYYY-MM-DD start date for timeline (optional)
+            "AAY_kg_per_card",
+            "PHH_kg_per_beneficiary",
+            "APL_kg_per_card",
         ],
-        "Value": [30, 11.5, 30, 3, 3],
+        "Value": [30, 11.5, 30, 3, 3, pd.Timestamp.today().strftime("%Y-%m-%d"), 35.0, 5.0, 0.0],
     })
 
     lgs = pd.DataFrame({
@@ -50,7 +55,11 @@ def template_workbook() -> bytes:
     fps = pd.DataFrame({
         "FPS_ID": [101, 102, 201],
         "FPS_Name": ["Shop_101", "Shop_102", "Shop_201"],
-        "Monthly_Demand_tons": [150.0, 90.0, 120.0],
+        # counts used to derive demand (user can still fill Monthly_Demand_tons to override)
+        "AAY_Count": [1000, 500, 800],
+        "PHH_Beneficiaries": [200, 100, 50],
+        "APL_Count": [50, 30, 20],
+        "Monthly_Demand_tons": [pd.NA, pd.NA, pd.NA],  # optional override
         "Max_Capacity_tons": [40.0, 30.0, 35.0],
         # Can be LG_ID (1/2) or LG_Name ("LG_A"/"LG_B")
         "Linked_LG_ID": ["LG_A", "LG_B", "LG_A"],
@@ -105,7 +114,7 @@ def load_inputs(src):
     xls.seek(0)
     fps = read_sheet(
         xls, "FPS",
-        required_cols={"FPS_ID", "Monthly_Demand_tons", "Max_Capacity_tons", "Linked_LG_ID"}
+        required_cols={"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
     )
     xls.seek(0)
     try:
@@ -115,6 +124,43 @@ def load_inputs(src):
         )
     except ValueError:
         vehicles = pd.DataFrame(columns=["Vehicle_ID", "Capacity_tons", "Mapped_LG_IDs"])
+
+    # --- derive Monthly_Demand_tons from RC counts automatically, but allow override ---
+    # Determine settings for eligibilities
+    def _get_setting_param(s_df, name, default):
+        try:
+            return float(s_df.loc[s_df["Parameter"] == name, "Value"].iloc[0])
+        except Exception:
+            return float(default)
+
+    AAY_kg = _get_setting_param(settings, "AAY_kg_per_card", 35.0)
+    PHH_kg = _get_setting_param(settings, "PHH_kg_per_beneficiary", 5.0)
+    APL_kg = _get_setting_param(settings, "APL_kg_per_card", 0.0)
+
+    # normalize/ensure count columns exist
+    fps = fps.copy()
+    fps["AAY_Count"] = fps.get("AAY_Count", 0)
+    fps["PHH_Beneficiaries"] = fps.get("PHH_Beneficiaries", 0)
+    fps["APL_Count"] = fps.get("APL_Count", 0)
+
+    fps["AAY_Count"] = pd.to_numeric(fps["AAY_Count"], errors="coerce").fillna(0.0)
+    fps["PHH_Beneficiaries"] = pd.to_numeric(fps["PHH_Beneficiaries"], errors="coerce").fillna(0.0)
+    fps["APL_Count"] = pd.to_numeric(fps["APL_Count"], errors="coerce").fillna(0.0)
+
+    # compute monthly demand (kg -> tons). If user provided Monthly_Demand_tons (non-null & >0) use that;
+    # otherwise prefer counts-derived demand.
+    fps["Monthly_from_counts_kg"] = (
+        fps["AAY_Count"] * AAY_kg
+        + fps["PHH_Beneficiaries"] * PHH_kg
+        + fps["APL_Count"] * APL_kg
+    )
+
+    counts_derived_tons = (fps["Monthly_from_counts_kg"] / 1000.0).fillna(0.0)
+    # existing column (may be missing)
+    orig_monthly = pd.to_numeric(fps.get("Monthly_Demand_tons", pd.NA), errors="coerce")
+    # pick override where user provided a positive number; otherwise counts-derived
+    fps["Monthly_Demand_tons"] = np.where(orig_monthly.notna() & (orig_monthly > 0), orig_monthly, counts_derived_tons)
+    fps["Daily_Demand_tons"] = fps["Monthly_Demand_tons"] / 30.0
 
     return settings, lgs, fps, vehicles
 
@@ -160,7 +206,7 @@ with st.expander("🔍 Preview Inputs", expanded=False):
         st.subheader("LGs")
         st.dataframe(lgs, use_container_width=True)
     with c2:
-        st.subheader("FPS")
+        st.subheader("FPS (counts-derived demand)")
         st.dataframe(fps, use_container_width=True)
         st.subheader("Vehicles")
         st.dataframe(vehicles, use_container_width=True)
@@ -191,7 +237,7 @@ if st.button("▶️ Run Simulation", use_container_width=True):
             "LGs":          lgs,
             "FPS":          fps,
             "Vehicles":     vehicles,
-            "LG_to_FPS":    dispatch_lg,     # keep clear names
+            "LG_to_FPS":    dispatch_lg,
             "CG_to_LG":     dispatch_cg,
             "Stock_Levels": stock_levels,
         }
@@ -201,7 +247,7 @@ if st.button("▶️ Run Simulation", use_container_width=True):
             label="📥 Download simulation_output.xlsx",
             data=excel_bytes,
             file_name="simulation_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet",
             use_container_width=True
         )
     except Exception as e:
