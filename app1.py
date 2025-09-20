@@ -8,8 +8,8 @@ import numpy as np
 
 from simulation import run_simulation  # make sure simulation.py is alongside this file
 
-st.set_page_config(page_title="Grain Distribution Simulator", layout="wide")
-st.title("🚛 Grain Distribution Simulator")
+st.set_page_config(page_title="Food Grain Distribution Simulator", layout="wide")
+st.title("🚛 Food Grain Distribution Simulator")
 
 # ---------------------------
 # Helpers
