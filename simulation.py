@@ -331,4 +331,293 @@ def run_simulation(
     # -----------------------------------------------
     # 4) Derive LG daily requirement from dispatch_lg
     # -----------------------------------------------
-    required_co_
+    required_cols = {"LG_ID", "Day", "Quantity_tons"}
+    missing = required_cols - set(dispatch_lg.columns)
+    if missing:
+        raise ValueError(f"dispatch_lg is missing required columns: {missing}")
+
+    if dispatch_lg.empty:
+        lg_daily_req = (
+            pd.MultiIndex.from_product([sorted(valid_lg_ids), range(1, DAYS + 1)], names=["LG_ID","Day"])
+            .to_frame(index=False)
+            .assign(Daily_Requirement_tons=0.0)
+        )
+    else:
+        lg_daily_req = (
+            dispatch_lg
+            .groupby(["LG_ID", "Day"])["Quantity_tons"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Quantity_tons": "Daily_Requirement_tons"})
+        )
+
+    req_pivot = lg_daily_req.pivot_table(
+        index="LG_ID", columns="Day",
+        values="Daily_Requirement_tons",
+        aggfunc="sum", fill_value=0.0
+    )
+
+    # -----------------------------------------------
+    # 5) CG -> LG PRE-DISPATCH (same DAYS timeline)
+    # -----------------------------------------------
+    try:
+        cap_df = pd.read_excel(master_workbook, sheet_name="LG_Capacity")
+        if {"LG_ID", "Capacity_tons"} <= set(cap_df.columns):
+            capacity = {int(r["LG_ID"]): float(r["Capacity_tons"]) for _, r in cap_df.iterrows()}
+        else:
+            raise ValueError
+    except Exception:
+        if "Storage_Capacity_tons" not in lgs.columns:
+            raise ValueError("Provide LG_Capacity sheet or 'Storage_Capacity_tons' in LGs.")
+        capacity = {int(r["LG_ID"]): float(r["Storage_Capacity_tons"]) for _, r in lgs.iterrows()}
+
+    lg_stock_base = {int(r["LG_ID"]): float(r.get("Initial_LG_stock", 0.0)) for _, r in lgs.iterrows()}
+
+    # Align types for req_pivot
+    req_pivot = req_pivot.copy()
+    req_pivot.index = [int(x) for x in req_pivot.index]
+    req_pivot.columns = [int(c) for c in req_pivot.columns]
+
+    lg_ids = list(req_pivot.index)
+
+    def _get_demand(lg_id: int, day: int) -> float:
+        try:
+            return float(req_pivot.at[lg_id, day])
+        except Exception:
+            return 0.0
+
+    def _free_room(stock: dict, lg_id: int) -> float:
+        return max(0.0, capacity.get(lg_id, 0.0) - stock.get(lg_id, 0.0))
+
+    def _simulate(pre_days: int, collect_rows: bool = False, include_pre_days: bool = False):
+        start_day = 1 - pre_days
+        stock = {lg: lg_stock_base.get(lg, 0.0) for lg in lg_ids}
+        rows = [] if collect_rows else None
+
+        for day in range(start_day, DAYS + 1):
+            trips_left = TOT_V
+
+            # A) Serve today's demand first (only when day >= 1)
+            if day >= 1:
+                order = sorted(lg_ids, key=lambda lg: -(_get_demand(lg, day) - stock[lg]))
+                for lg in order:
+                    demand_today = _get_demand(lg, day)
+                    need_today = max(0.0, demand_today - stock[lg])
+
+                    while trips_left > 0 and need_today > 1e-9:
+                        room = _free_room(stock, lg)
+                        if room <= 1e-9:
+                            break
+                        qty = min(TRUCK_CAP, need_today, room)
+                        if qty <= 1e-9:
+                            break
+
+                        if collect_rows and (include_pre_days or day >= 1):
+                            vid = TOT_V - trips_left + 1
+                            row_date = day_to_date.get(int(day), start_date.date())
+                            rows.append({
+                                "Day": int(day),
+                                "Date": row_date,
+                                "Vehicle_ID": int(vid),
+                                "LG_ID": int(lg),
+                                "Quantity_tons": float(qty)
+                            })
+
+                        stock[lg] += qty
+                        trips_left -= 1
+                        need_today -= qty
+
+                    if stock[lg] + 1e-6 < demand_today:
+                        return False, (rows or []), start_day, stock
+
+            # B) Pre-stock round-robin with remaining trips
+            if trips_left > 0:
+                future_unmet = {
+                    lg: max(0.0, sum(_get_demand(lg, d) for d in range(max(1, day + 1), DAYS + 1)) - stock[lg])
+                    for lg in lg_ids
+                }
+                candidates = [lg for lg, fu in future_unmet.items() if fu > 1e-6 and _free_room(stock, lg) > 1e-6]
+                idx = 0
+                while trips_left > 0 and candidates:
+                    lg = candidates[idx % len(candidates)]
+                    room = _free_room(stock, lg)
+                    deliver = min(TRUCK_CAP, future_unmet[lg], room)
+
+                    if deliver > 1e-9:
+                        if collect_rows and (include_pre_days or day >= 1):
+                            vid = TOT_V - trips_left + 1
+                            row_date = day_to_date.get(int(day), start_date.date())
+                            rows.append({
+                                "Day": int(day),
+                                "Date": row_date,
+                                "Vehicle_ID": int(vid),
+                                "LG_ID": int(lg),
+                                "Quantity_tons": float(deliver)
+                            })
+                        stock[lg] += deliver
+                        future_unmet[lg] = max(0.0, future_unmet[lg] - deliver)
+                        trips_left -= 1
+
+                    if future_unmet[lg] < 1e-6 or _free_room(stock, lg) < 1e-6:
+                        candidates.remove(lg)
+                        idx -= 1
+                    idx += 1
+
+            # C) End-of-day consumption (only Day >= 1)
+            if day >= 1:
+                for lg in lg_ids:
+                    stock[lg] = max(0.0, stock[lg] - _get_demand(lg, day))
+
+        return True, (rows or []), start_day, stock
+
+    # Find minimal pre_days that makes schedule feasible
+    pre_days = None
+    for x in range(0, MAX_PRE_DAYS + 1):
+        ok, _, start_day, _ = _simulate(pre_days=x, collect_rows=False)
+        if ok:
+            pre_days = x
+            break
+
+    if pre_days is None:
+        raise RuntimeError("Unable to meet all demands within MAX_PRE_DAYS.")
+
+    # Re-run with logging, include pre-days
+    ok, rows, start_day, _ = _simulate(pre_days=pre_days, collect_rows=True, include_pre_days=True)
+    assert ok
+
+    dispatch_cg = pd.DataFrame(rows, columns=["Day", "Date", "Vehicle_ID", "LG_ID", "Quantity_tons"])
+
+    # Build accurate LG stock levels (init + CG_cum - LG_cum)
+    lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
+
+    if "Initial_LG_stock" in lgs.columns:
+        init_series = (
+            lgs.assign(LG_ID=lgs["LG_ID"].astype(int))
+               .set_index("LG_ID")["Initial_LG_stock"]
+               .reindex(lg_ids_sorted).fillna(0.0)
+        )
+    else:
+        init_series = pd.Series(0.0, index=lg_ids_sorted)
+
+    # Compute cg cumulative
+    if not dispatch_cg.empty:
+        dcg = dispatch_cg.copy()
+        dcg["LG_ID"] = dcg["LG_ID"].astype(int)
+        dcg["Day"]   = dcg["Day"].astype(int)
+        cg_piv = dcg.pivot_table(index="LG_ID", columns="Day",
+                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        full_cols = list(range(start_day, DAYS + 1))
+        cg_piv = cg_piv.reindex(index=lg_ids_sorted, columns=full_cols, fill_value=0.0)
+        cg_cum = cg_piv.cumsum(axis=1).reindex(columns=list(range(1, DAYS + 1)), fill_value=0.0)
+    else:
+        cg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+
+    # LG→FPS cumulative from dispatch_lg
+    if not dispatch_lg.empty:
+        dlg = dispatch_lg.copy()
+        dlg["LG_ID"] = dlg["LG_ID"].astype(int)
+        dlg["Day"]   = dlg["Day"].astype(int)
+        lg_piv = dlg.pivot_table(index="LG_ID", columns="Day",
+                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        lg_piv = lg_piv.reindex(index=lg_ids_sorted, columns=list(range(1, DAYS + 1)), fill_value=0.0)
+        lg_cum = lg_piv.cumsum(axis=1)
+    else:
+        lg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+
+    stock_matrix = init_series.to_numpy()[:, None] + cg_cum.to_numpy() - lg_cum.to_numpy()
+    stock_matrix = np.where(np.abs(stock_matrix) < 1e-9, 0.0, stock_matrix)
+
+    lg_stock_levels = (
+        pd.DataFrame(stock_matrix, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+          .stack().rename("Stock_Level_tons")
+          .rename_axis(index=["LG_ID", "Day"]).reset_index()
+          .rename(columns={"LG_ID": "Entity_ID"})
+          .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+    )
+
+    pre_cols = list(range(start_day, 1))
+    if pre_cols:
+        if not dispatch_cg.empty:
+            cg_pre = cg_piv.reindex(index=lg_ids_sorted, columns=pre_cols, fill_value=0.0)
+            cg_pre_cum = cg_pre.cumsum(axis=1)
+        else:
+            cg_pre_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=pre_cols)
+
+        stock_pre_matrix = init_series.to_numpy()[:, None] + cg_pre_cum.to_numpy()
+        stock_pre_matrix = np.where(np.abs(stock_pre_matrix) < 1e-9, 0.0, stock_pre_matrix)
+
+        lg_stock_levels_pre = (
+            pd.DataFrame(stock_pre_matrix, index=lg_ids_sorted, columns=pre_cols)
+              .stack().rename("Stock_Level_tons")
+              .rename_axis(index=["LG_ID", "Day"]).reset_index()
+              .rename(columns={"LG_ID": "Entity_ID"})
+              .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+        )
+    else:
+        lg_stock_levels_pre = pd.DataFrame(columns=["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"])
+
+    lg_stock_levels = pd.concat([lg_stock_levels_pre, lg_stock_levels], ignore_index=True)
+
+    # Append FPS stock rows (which already have Day and Date) to LG stock rows
+    if 'Date' not in stock_levels.columns:
+        stock_levels['Date'] = pd.NaT
+
+    final_stock_levels = pd.concat(
+        [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels],
+        ignore_index=True
+    )
+
+    # --- Now: split CG->LG dispatch rows by LG-level composition (derived from FPS counts)
+    # compute LG composition by summing monthly_from_counts_kg across FPS for each LG
+    lg_comp_df = fps.groupby("LG_ID").agg({
+        "Monthly_from_counts_kg": "sum",
+        "AAY_Count": "sum",
+        "PHH_Beneficiaries": "sum",
+        "APL_Count": "sum"
+    }).rename(columns={"Monthly_from_counts_kg": "LG_monthly_counts_kg"})
+
+    # compute LG fractions (AAY/PHH/APL) using counts-based kg if available
+    lg_comp = {}
+    for lgid, row in lg_comp_df.iterrows():
+        total_kg = float(row["LG_monthly_counts_kg"])
+        if total_kg > 0:
+            aay_kg = float(row["AAY_Count"]) * AAY_kg
+            phh_kg = float(row["PHH_Beneficiaries"]) * PHH_kg
+            apl_kg = float(row["APL_Count"]) * APL_kg
+            s = aay_kg + phh_kg + apl_kg
+            if s <= 0:
+                lg_comp[lgid] = {"AAY_frac": 0.0, "PHH_frac": 0.0, "APL_frac": 0.0}
+            else:
+                lg_comp[lgid] = {"AAY_frac": aay_kg / s, "PHH_frac": phh_kg / s, "APL_frac": apl_kg / s}
+        else:
+            lg_comp[lgid] = {"AAY_frac": 0.0, "PHH_frac": 0.0, "APL_frac": 0.0}
+
+    # Enrich dispatch_cg with category splits using LG-level fractions
+    if not dispatch_cg.empty:
+        dispatch_cg = dispatch_cg.copy()
+        dispatch_cg["LG_ID"] = dispatch_cg["LG_ID"].astype(int)
+        def _split_row(row):
+            lgid = int(row["LG_ID"])
+            qty = float(row["Quantity_tons"])
+            frac = lg_comp.get(lgid, {"AAY_frac": 0.0, "PHH_frac": 0.0, "APL_frac": 0.0})
+            aay = qty * frac["AAY_frac"]
+            phh = qty * frac["PHH_frac"]
+            apl = qty * frac["APL_frac"]
+            nfsa = aay + phh
+            return pd.Series({"AAY_tons": aay, "PHH_tons": phh, "APL_tons": apl, "NFSA_tons": nfsa})
+        splits = dispatch_cg.apply(_split_row, axis=1)
+        dispatch_cg = pd.concat([dispatch_cg.reset_index(drop=True), splits.reset_index(drop=True)], axis=1)
+    else:
+        # ensure columns present
+        dispatch_cg = pd.DataFrame(columns=["Day", "Date", "Vehicle_ID", "LG_ID", "Quantity_tons", "AAY_tons", "PHH_tons", "APL_tons", "NFSA_tons"])
+
+    # ensure dispatch_lg always has category columns (already included earlier), but be defensive
+    for col in ("AAY_tons", "PHH_tons", "APL_tons", "NFSA_tons"):
+        if col not in dispatch_lg.columns:
+            dispatch_lg[col] = 0.0
+
+    for col in ("AAY_tons", "PHH_tons", "APL_tons", "NFSA_tons"):
+        if col not in dispatch_cg.columns:
+            dispatch_cg[col] = 0.0
+
+    return dispatch_cg, dispatch_lg, final_stock_levels
